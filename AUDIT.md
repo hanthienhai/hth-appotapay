@@ -1,0 +1,69 @@
+# Kiểm toán bảo mật plugin hth-appotapay
+
+Ngày: 15/10/2026 · Phiên bản: 0.2.0 · Môi trường thử: WordPress 7.1.3, PHP 8.2, WooCommerce 11.2.1, HPOS bật, chạy trên WordPress Studio với dữ liệu của một shop thật
+
+## Phạm vi và cách làm
+
+- Đọc từng dòng hai tệp `includes/class-hth-appotapay-client.php` và `includes/class-hth-appotapay-gateway.php`, rồi đi theo từng đường mà kẻ xấu hoặc sự cố có thể chạm tới: tạo giao dịch, IPN, trang khách quay về, đối soát, tra lại định kỳ, hoàn tiền, cài đặt.
+- So code với skill chính thức `AppotaPayInc/skills` (appotapay-auth, appotapay-payment). Đối chiếu tài liệu live trên docs.appotapay.com ngày 15/10/2026: trùng khớp với bản chụp trong skill.
+- Bộ thử `tests/run.php` giả lập phản hồi AppotaPay qua `pre_http_request`: 51 bài ở môi trường local và 52 bài ở production (thêm một bài cho chế độ sandbox), đạt hết ở cả hai. Thêm vào đó là các lần gọi HTTP thật tới sandbox và một lần trả tiền thật bằng thẻ test.
+
+Chạy lại bộ thử:
+
+```bash
+studio wp eval-file wp-content/plugins/hth-appotapay/tests/run.php
+```
+
+## Lỗi tìm thấy và đã sửa
+
+| # | Mức | Lỗi | Hậu quả nếu để nguyên | Cách sửa | Bài thử |
+|---|---|---|---|---|---|
+| 1 | Cao | Quên tắt sandbox khi lên site thật | Ai cũng trả được bằng thẻ test công khai trong tài liệu AppotaPay; đơn chuyển "đã thanh toán", shop giao hàng mà không thu được tiền | Trên môi trường `production`, chế độ sandbox ẩn cổng với khách, chỉ quản trị viên thấy; wp-admin hiện cảnh báo vàng | Sandbox + production + khách / quản trị viên |
+| 2 | Cao | Hoàn tiền bị mất kết nối, quản trị viên bấm hoàn lại | Lệnh mới mang mã mới, AppotaPay coi là lệnh khác: khách được hoàn hai lần | Lưu lệnh đang treo vào đơn; lần sau tra lệnh cũ trước (`GET /api/v2/transaction/refund/{ref}`), chỉ gửi lệnh mới khi chắc lệnh cũ không tồn tại (lỗi 36) hoặc đã thất bại | 4 bài "Lệnh treo…" |
+| 3 | Cao | Khách mở hai tab và trả cả hai lần | Lần trả thứ hai bị bỏ qua không dấu vết: shop giữ tiền thừa của khách mà không biết | Ghi chú "CẢNH BÁO… cần hoàn" (đúng một lần) kèm mã giao dịch thừa; giữ nguyên mã giao dịch gốc | "Thanh toán trùng…" |
+| 4 | Vừa | Khoá chống xử lý đôi không có hạn | Nếu PHP chết giữa chừng (hết thời gian, hết RAM), khoá kẹt mãi; đơn đó không bao giờ được xác nhận dù khách đã trả | Khoá tự hết hạn sau 60 giây | "Khoá kẹt quá 60 giây…" |
+| 5 | Vừa | IPN tới khi API còn báo `pending` | Plugin trả "ok", AppotaPay thôi gửi lại; nếu khách đã đóng tab, đơn kẹt ở "chờ thanh toán" | Trả 503 để AppotaPay gửi lại sau 5 phút (tối đa 3 lần) | HTTP thật: IPN chữ ký đúng → 503 |
+| 6 | Vừa | Callback vẫn được nhận khi chưa nhập Secret Key | Ai cũng ký được bằng khoá rỗng. API tra lại đã chặn được, nhưng không nên dựa vào một lớp | Khoá rỗng thì từ chối mọi callback | "Khoá rỗng…" |
+| 7 | Vừa | Secret Key chỉ lưu được trong DB | Khoá nằm trong mọi bản sao lưu DB và trong mã HTML trang cài đặt | Cho đặt khoá bằng hằng số trong `wp-config.php`; ô trong trang cài đặt tự khoá lại | Kiểm tay |
+| 8 | Vừa | Đơn đã trả nhận về kết quả lệch bị kéo về "tạm giữ" | Đơn đã thu tiền bỗng thành chưa thanh toán | Đơn đã trả chỉ nhận ghi chú cảnh báo, giữ trạng thái | "Kết quả lệch trên đơn đã trả…" |
+| 9 | Thấp | Mã tham chiếu chỉ dựa vào giây hiện tại | Hai lần bấm trong cùng một giây bị AppotaPay báo trùng mã (lỗi 30) | Thêm 3 chữ số ngẫu nhiên | "Mã tham chiếu không trùng…" |
+| 10 | Thấp | Không kiểm tiền tệ khi đối soát | Kết quả bằng đơn vị khác VND vẫn được nhận | Bắt buộc `currency = VND` | "Sai tiền tệ…" |
+| 11 | Thấp | Chuyển khách tới bất kỳ link nào API trả về | Nếu phản hồi bị giả mạo, khách bị đưa tới trang lừa nhập thẻ | Chỉ nhận link `https://…appotapay.com` | "Từ chối link…" |
+| 12 | Thấp | Không ghi lại các lần gọi với chữ ký sai | Không thấy được ai đang dò IPN | Ghi IP vào log khi bật "Ghi log" | Kiểm tay |
+| 13 | Thấp | Danh sách mã tham chiếu có phần tử rỗng | Vô hại, chỉ làm bẩn dữ liệu | Lọc phần tử rỗng | "…không có phần tử rỗng" |
+| 14 | Cao | Khách trả xong rồi đóng tab, đồng thời cả 3 lần IPN bị chặn | Đơn nằm ở "chờ thanh toán" dù tiền đã về; WooCommerce có thể tự huỷ đơn khi hết giờ giữ hàng | Action Scheduler chạy `hth_appotapay_reconcile` 10 phút một lần: tra lại đơn AppotaPay ở trạng thái chờ thanh toán, lỗi hoặc đã huỷ, tạo trong 24 giờ gần nhất, tối đa 10 đơn mỗi lượt (đơn vừa tra xuống cuối hàng). Dùng chung `reconcile()` với IPN nên giữ nguyên khoá và mọi kiểm tra. Giao dịch đã thất bại được nhớ lại để không tra và ghi chú lặp. Lịch đăng ký khi bật plugin, gỡ khi tắt, tự đăng ký bù khi vào wp-admin | 16 bài mục 6 |
+| 15 | Vừa | Tiền tố mã đơn viết cứng trong code | Hai site dùng chung một tài khoản AppotaPay sinh trùng mã đơn: AppotaPay báo lỗi 30, hoặc IPN của site này bị site kia nhận | Thêm ô "Tiền tố mã đơn" (2–6 chữ cái, mặc định `HTH`), kiểm khi lưu | 3 bài mục 0 |
+
+## Những gì đã đúng từ đầu
+
+- JWT tạo phía máy chủ, sống 5 phút, có header `cty`, mỗi lần gọi một mã `jti` mới.
+- Chữ ký HMAC-SHA256 kiểm trên chuỗi `data` thô, so bằng `hash_equals` để không lộ chữ ký qua thời gian phản hồi.
+- Không tin dữ liệu callback: chỉ lấy mã đơn từ đó, còn trạng thái và số tiền luôn lấy từ API tra cứu.
+- Chỉ nhận mã tham chiếu mà chính đơn đó đã sinh ra; mã hợp lệ của đơn khác bị từ chối.
+- Mất mạng khi tạo giao dịch thì báo lỗi cho khách, không tự gửi lại.
+- Khách không nhập số thẻ trên site, nên site không phải đạt chuẩn PCI.
+- Ghi chú đơn đi qua bộ lọc `wp_kses_post` của WooCommerce; nội dung lỗi từ API không chèn được mã độc.
+- Quyền hoàn tiền do WooCommerce kiểm (quyền `edit_shop_orders` và nonce).
+
+## Rủi ro còn lại
+
+Chưa sửa trong code, cần biết trước khi chạy thật:
+
+1. **Giờ giữ hàng của WooCommerce.** Phiên thanh toán AppotaPay sống khoảng 30 phút. Nếu "Giữ hàng" (Cài đặt → Sản phẩm → Kho hàng) ngắn hơn, đơn có thể bị huỷ trước khi khách trả xong. Plugin vẫn xác nhận lại được đơn đã huỷ, nhưng kho bị trả về rồi trừ lại. Nên đặt giờ giữ hàng từ 60 phút trở lên.
+2. **Tệp log trên OpenLiteSpeed.** WooCommerce chặn thư mục `uploads/wc-logs` bằng `.htaccess`, mà OLS bỏ qua lệnh `Require all denied`. Tên tệp log có chuỗi băm khó đoán, nhưng log vẫn chứa số thẻ đã che và tên chủ thẻ. Khi chạy thật thì tắt "Ghi log".
+3. **Trang "Đã nhận đơn hàng".** Đường link khách quay về mang khoá đơn. Ai có link đó xem được thông tin đơn. Đây là cách WooCommerce vẫn làm, plugin không đổi.
+4. **Checkout dạng khối (block).** Plugin chỉ chạy với checkout shortcode cổ điển (`[woocommerce_checkout]`). Site nào dùng trang thanh toán dạng khối thì cổng không hiện.
+5. **Thư mục `tests/`.** Tệp `tests/run.php` chỉ chạy được qua WP-CLI, nhưng vẫn nên bỏ thư mục này khi chép lên site thật.
+
+## Danh sách việc khi lên production
+
+- [ ] Đặt 3 hằng số `HTH_APPOTAPAY_PARTNER_CODE`, `HTH_APPOTAPAY_API_KEY`, `HTH_APPOTAPAY_SECRET_KEY` trong `wp-config.php` bằng khoá production.
+- [ ] Bỏ chọn "Môi trường thử"; tắt "Ghi log".
+- [ ] Đặt "Tiền tố mã đơn" riêng cho site, trước khi có đơn đầu tiên.
+- [ ] Đăng ký IP gọi ra của máy chủ với AppotaPay.
+- [ ] Cho POST tới `/wc-api/hth_appotapay_ipn/` đi qua tường lửa và WAF; không cache `/wc-api/*`.
+- [ ] Đồng bộ giờ máy chủ (NTP).
+- [ ] Đặt giờ giữ hàng ≥ 60 phút.
+- [ ] Sau khi bật plugin, xem Công cụ → Lịch tác vụ (nhóm `hth-appotapay`): `hth_appotapay_reconcile` phải chạy đều 10 phút một lần. Nếu site tắt WP-Cron thì phải có cron hệ thống gọi `wp-cron.php`, không thì việc tra lại không chạy.
+- [ ] Đóng gói bằng `git archive --format=zip -o hth-appotapay.zip --prefix=hth-appotapay/ HEAD`. Gói này bỏ sẵn `.git/` và `tests/`. Đừng chép nguyên thư mục, vì OLS sẽ để lộ `.git/` ra web.
+- [ ] Trả thử một đơn nhỏ bằng thẻ thật, rồi hoàn tiền chính đơn đó để kiểm cả hai chiều.
