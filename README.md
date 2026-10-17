@@ -12,6 +12,7 @@ Code theo luồng hosted checkout v2 trong [tài liệu AppotaPay](https://docs.
 - Hoàn tiền ngay trong trang đơn hàng của WooCommerce. Nếu lệnh hoàn bị mất kết nối, lần sau plugin tra lệnh cũ trước, nên không hoàn hai lần.
 - Cảnh báo trong ghi chú đơn khi khách trả hai lần cho cùng một đơn.
 - Khách không nhập số thẻ trên site, nên site không phải đạt chuẩn PCI.
+- Xoá plugin thì `uninstall.php` dọn option cài đặt và khoá lẻ; meta trên đơn hàng giữ lại làm lịch sử.
 
 ## Yêu cầu
 
@@ -63,7 +64,7 @@ Trên site production, chế độ sandbox chỉ hiện cổng cho quản trị 
 - Đồng bộ giờ máy chủ bằng NTP, vì mã xác thực gửi AppotaPay chỉ sống 5 phút.
 - Đặt giờ giữ hàng của WooCommerce từ 60 phút trở lên.
 - Nếu site tắt WP-Cron, phải có cron hệ thống gọi `wp-cron.php`, nếu không việc tra lại định kỳ sẽ không chạy.
-- Tắt "Ghi log". Log chứa số thẻ đã che và tên chủ thẻ.
+- Tắt "Ghi log". Link thanh toán, số thẻ và tên chủ thẻ đã được che trước khi ghi, nhưng log vẫn kể lại từng giao dịch.
 
 Danh sách đầy đủ nằm ở cuối [AUDIT.md](AUDIT.md).
 

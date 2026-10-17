@@ -25,19 +25,24 @@ add_filter( 'pre_http_request', function ( $pre, $args, $url ) use ( &$mock ) {
 	return [ 'headers' => [], 'body' => wp_json_encode( $r[1] ), 'response' => [ 'code' => $r[0], 'message' => '' ], 'cookies' => [], 'filename' => null ];
 }, 10, 3 );
 
-$g      = WC()->payment_gateways()->payment_gateways()['hth_appotapay'];
-$secret = $g->get_option( 'secret_key' );
-$call   = function ( string $method, ...$args ) use ( $g ) {
+$g    = WC()->payment_gateways()->payment_gateways()['hth_appotapay'];
+$call = function ( string $method, ...$args ) use ( $g ) {
 	$m = new ReflectionMethod( $g, $method );
 	$m->setAccessible( true );
 	return $m->invoke( $g, ...$args );
 };
-$px = $call( 'prefix' );
+$secret = $call( 'credential', 'secret_key' );
+$px     = $call( 'prefix' );
 
 // 0. Tiền tố mã đơn.
 $check( 'Tiền tố hiện tại hợp lệ: ' . $px, (bool) preg_match( '/^[A-Z]{2,6}$/', $px ) );
 $check( 'Tiền tố nhập chữ thường: tự viết hoa', 'ABC' === $g->validate_order_prefix_field( 'order_prefix', ' abc ' ) );
 $check( 'Tiền tố có số hoặc dấu: giữ giá trị cũ', $px === $g->validate_order_prefix_field( 'order_prefix', 'A1-' ) );
+foreach ( HTH_AppotaPay_Gateway::CONSTANTS as $k => $c ) {
+	if ( defined( $c ) ) {
+		$check( "Hằng số $c đã đặt: trang cài đặt không in giá trị DB của $k", '' === $g->get_option( $k ) );
+	}
+}
 
 $product = wc_get_products( [ 'limit' => 1, 'status' => 'publish', 'type' => 'simple', 'stock_status' => 'instock' ] )[0];
 $orders  = [];
@@ -75,6 +80,41 @@ $check( 'Mã tham chiếu chỉ gồm chữ và số', (bool) preg_match( '/^[A-
 $mock = fn() => new WP_Error( 'timeout', 'timeout' );
 $check( 'Mất mạng khi tạo giao dịch: báo lỗi, không gửi lại', 'failure' === $g->process_payment( $o->get_id() )['result'] );
 
+// Client: không theo redirect, timeout riêng từng lệnh, log che link thanh toán và thông tin thẻ.
+$logs = [];
+$lc   = new HTH_AppotaPay_Client( 'P', 'K', 'S', true, function ( $m ) use ( &$logs ) {
+	$logs[] = $m;
+} );
+$seen = [];
+$mock = function ( $m, $url, $args ) use ( &$seen ) {
+	$seen = $args;
+	return [ 200, [] ];
+};
+$lc->create_payment( [], 'vi' );
+$check( 'Tạo giao dịch: không theo redirect, chờ tối đa 15 giây', 0 == $seen['redirection'] && 15 == $seen['timeout'] );
+$lc->get_transaction_by_partner_ref( 'X' );
+$check( 'Tra giao dịch: không theo redirect, chờ tối đa 10 giây', 0 == $seen['redirection'] && 10 == $seen['timeout'] );
+$lc->get_refund_by_partner_ref( 'X' );
+$check( 'Tra lệnh hoàn: chờ tối đa 10 giây', 10 == $seen['timeout'] );
+$lc->refund( [] );
+$check( 'Hoàn tiền: giữ 30 giây', 30 == $seen['timeout'] );
+
+$logs = [];
+$mock = fn() => [ 200, [
+	'transaction' => [ 'transactionId' => 'APL1', 'status' => 'success' ],
+	'payment'     => [ 'url' => 'https://payment.dev.appotapay.com/secret-link-xyz' ],
+	'cardInfo'    => [ 'cardNumber' => '970422xxxx4047', 'cardName' => 'ARTURO MOEN' ],
+	'tokenInfo'   => [ 'token' => 'tok_abc', 'number' => '400000-1091', 'holder_name' => 'NGUYEN VAN A' ],
+] ];
+$lc->create_payment( [], 'vi' );
+$all = implode( "\n", $logs );
+$check( 'Log che link thanh toán, số thẻ, tên chủ thẻ, token', false === strpos( $all, 'secret-link' ) && false === strpos( $all, '4047' ) && false === strpos( $all, 'ARTURO' ) && false === strpos( $all, '1091' ) && false === strpos( $all, 'NGUYEN' ) && false === strpos( $all, 'tok_abc' ) );
+$check( 'Log vẫn ghi mã giao dịch và trạng thái', false !== strpos( $all, 'APL1' ) && false !== strpos( $all, 'success' ) );
+$logs = [];
+$mock = fn() => [ 200, '<html>bad gateway</html>' ];
+[ $lc_code, $lc_body ] = $lc->create_payment( [], 'vi' );
+$check( 'Body không phải JSON: trả null, log ghi rõ', 200 === $lc_code && null === $lc_body && false !== strpos( implode( '', $logs ), 'không phải JSON' ) );
+
 // 2. Đối soát: chỉ xác nhận khi API báo success, khớp số tiền, mã đơn và tiền tệ.
 $o     = $new_order();
 $ref   = $px . $o->get_id() . 'T1000';
@@ -110,6 +150,19 @@ $check( 'Khoá còn mới: tiến trình thứ hai không xác nhận chồng', 
 delete_option( 'hth_appotapay_lock_' . $o->get_id() );
 delete_option( 'hth_appotapay_lock_' . $o2->get_id() );
 
+// Khoá ghi thẳng vào wp_options bằng INSERT IGNORE: lấy hai lần liền thì lần hai bị từ chối.
+global $wpdb;
+$lock_key = 'hth_appotapay_lock_' . $o2->get_id();
+$check( 'Lấy khoá lần đầu: được', true === $call( 'lock', $o2->get_id() ) );
+$check( 'Lấy khoá lần hai khi khoá còn mới: bị từ chối', false === $call( 'lock', $o2->get_id() ) );
+$lock_row = $wpdb->get_row( $wpdb->prepare( "SELECT option_value, autoload FROM {$wpdb->options} WHERE option_name = %s", $lock_key ) );
+$check( 'Khoá nằm trong wp_options, không autoload, mang giờ hiện tại', $lock_row && in_array( $lock_row->autoload, [ 'no', 'off' ], true ) && (int) $lock_row->option_value >= time() - 5 );
+$wpdb->update( $wpdb->options, [ 'option_value' => (string) ( time() - 120 ) ], [ 'option_name' => $lock_key ] );
+$check( 'Khoá kẹt quá 60 giây: giành lại được bằng UPDATE', true === $call( 'lock', $o2->get_id() ) );
+$check( 'Giành lại xong thì khoá lại mới: lần sau bị từ chối', false === $call( 'lock', $o2->get_id() ) );
+$call( 'unlock', $o2->get_id() );
+$check( 'Gỡ khoá: option biến mất', false === get_option( $lock_key ) && null === $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM {$wpdb->options} WHERE option_name = %s", $lock_key ) ) );
+
 // Kết quả lạ cho đơn đã trả: chỉ ghi chú, không kéo đơn về tạm giữ.
 $mock = fn() => $txn_ok( $ref, $total - 1000, 'APA1' );
 $call( 'reconcile', wc_get_order( $o->get_id() ), $ref );
@@ -136,12 +189,23 @@ $check( 'Thanh toán trùng: không đổi mã giao dịch gốc', 'APA1' === wc
 // 3. Callback: chữ ký, mã đơn lạ, khoá rỗng.
 $client = new HTH_AppotaPay_Client( 'P', 'K', $secret, true );
 $data   = base64_encode( wp_json_encode( [ 'partnerReference' => [ 'order' => [ 'id' => $ref ] ] ] ) );
-$check( 'Chữ ký đúng: nhận', null !== $client->verify_callback( $data, hash_hmac( 'sha256', $data, $secret ) ) );
-$check( 'Chữ ký sai: từ chối', null === $client->verify_callback( $data, str_repeat( '0', 64 ) ) );
-$check( 'Thiếu chữ ký: từ chối', null === $client->verify_callback( $data, null ) );
-$check( 'Data bị sửa: từ chối', null === $client->verify_callback( $data . 'x', hash_hmac( 'sha256', $data, $secret ) ) );
+$sig    = hash_hmac( 'sha256', $data, $secret );
+$now    = (string) time();
+$check( 'Chữ ký đúng: nhận', null !== $client->verify_callback( $data, $sig, $now ) );
+$check( 'Chữ ký sai: từ chối', null === $client->verify_callback( $data, str_repeat( '0', 64 ), $now ) );
+$check( 'Thiếu chữ ký: từ chối', null === $client->verify_callback( $data, null, $now ) );
+$check( 'Data bị sửa: từ chối', null === $client->verify_callback( $data . 'x', $sig, $now ) );
 $empty = new HTH_AppotaPay_Client( 'P', 'K', '', true );
-$check( 'Khoá rỗng: từ chối cả chữ ký tự ký bằng khoá rỗng', null === $empty->verify_callback( $data, hash_hmac( 'sha256', $data, '' ) ) );
+$check( 'Khoá rỗng: từ chối cả chữ ký tự ký bằng khoá rỗng', null === $empty->verify_callback( $data, hash_hmac( 'sha256', $data, '' ), $now ) );
+
+// Trường time: callback cũ quá 24 giờ không còn là vé xem đơn; nhận Unix giây (chuỗi hoặc số như IPN) và mili giây.
+$check( 'Callback time cách 23 giờ: nhận', null !== $client->verify_callback( $data, $sig, (string) ( time() - 23 * HOUR_IN_SECONDS ) ) );
+$check( 'Callback time cũ quá 24 giờ: từ chối dù chữ ký đúng', null === $client->verify_callback( $data, $sig, (string) ( time() - 25 * HOUR_IN_SECONDS ) ) );
+$check( 'Callback time ở tương lai quá 24 giờ: từ chối', null === $client->verify_callback( $data, $sig, (string) ( time() + 25 * HOUR_IN_SECONDS ) ) );
+$check( 'Callback thiếu time: từ chối', null === $client->verify_callback( $data, $sig, '' ) && null === $client->verify_callback( $data, $sig, null ) );
+$check( 'Callback time không phải số: từ chối', null === $client->verify_callback( $data, $sig, '2024-09-11T11:32:58' ) && ! HTH_AppotaPay_Client::is_fresh( [ 'x' ] ) );
+$check( 'Callback time là số JSON (IPN): nhận', null !== $client->verify_callback( $data, $sig, time() ) );
+$check( 'Callback time dạng mili giây: nhận', HTH_AppotaPay_Client::is_fresh( (string) ( time() * 1000 ) ) && ! HTH_AppotaPay_Client::is_fresh( (string) ( ( time() - 25 * HOUR_IN_SECONDS ) * 1000 ) ) );
 $from_ref = new ReflectionMethod( HTH_AppotaPay_Gateway::class, 'order_from_ref' );
 $from_ref->setAccessible( true );
 $check( 'Mã đơn hợp lệ của đơn khác: từ chối', null === $from_ref->invoke( $g, $px . $o->get_id() . 'T9999' ) );
@@ -189,6 +253,44 @@ $r = $g->process_refund( $o->get_id(), 50000, 'test' );
 $check( 'Chưa tra được lệnh treo: không gửi lệnh mới', is_wp_error( $r ) && 1 === count( $sent ) );
 $check( 'Hoàn dưới 1.000đ: từ chối', is_wp_error( $g->process_refund( $o->get_id(), 500, 'x' ) ) );
 
+// Lệnh hoàn gặp 5xx hoặc body không phải JSON: AppotaPay có thể đã nhận lệnh, phải nhớ lệnh treo như khi mất mạng.
+$clear_inflight = function () use ( $o ) {
+	$o = wc_get_order( $o->get_id() );
+	$o->delete_meta_data( '_hth_appotapay_refund_inflight' );
+	$o->save();
+};
+$inflight_ref = fn() => (string) ( wc_get_order( $o->get_id() )->get_meta( '_hth_appotapay_refund_inflight' )['ref'] ?? '' );
+$clear_inflight();
+$sent = [];
+$mock = function ( $m, $url ) use ( &$sent ) {
+	$sent[] = $m . ' ' . $url;
+	return [ 504, null ];
+};
+$r = $g->process_refund( $o->get_id(), 50000, 'test' );
+$check( 'Hoàn tiền gặp 504 không có JSON: báo lỗi và nhớ lệnh treo', is_wp_error( $r ) && '' !== $inflight_ref() );
+$sent = [];
+$mock = function ( $m, $url ) use ( &$sent ) {
+	$sent[] = $m . ' ' . $url;
+	return false !== strpos( $url, '/refund/' ) ? [ 200, [ 'status' => 'success', 'refundId' => 'R3' ] ] : [ 200, [ 'status' => 'pending', 'refundId' => 'R4' ] ];
+};
+$r = $g->process_refund( $o->get_id(), 50000, 'test' );
+$check( 'Sau 504, lệnh treo thật ra đã được nhận: chỉ GET tra, không POST lệnh mới', is_wp_error( $r ) && 1 === count( $sent ) && 0 === strpos( $sent[0], 'GET' ) );
+
+$clear_inflight();
+$mock = fn() => [ 500, [ 'errorCode' => 500, 'message' => 'Internal Server Error' ] ];
+$r    = $g->process_refund( $o->get_id(), 50000, 'test' );
+$check( 'Hoàn tiền gặp 500 có JSON: vẫn nhớ lệnh treo', is_wp_error( $r ) && '' !== $inflight_ref() );
+
+$clear_inflight();
+$mock = fn() => [ 200, '<html>bad gateway</html>' ];
+$r    = $g->process_refund( $o->get_id(), 50000, 'test' );
+$check( 'Hoàn tiền trả 200 nhưng body không phải JSON: nhớ lệnh treo', is_wp_error( $r ) && '' !== $inflight_ref() );
+
+$clear_inflight();
+$mock = fn() => [ 400, [ 'errorCode' => 12, 'message' => 'Số tiền vượt quá giao dịch gốc' ] ];
+$r    = $g->process_refund( $o->get_id(), 50000, 'test' );
+$check( 'AppotaPay từ chối rõ ràng (4xx có JSON): không nhớ lệnh treo', is_wp_error( $r ) && '' === $inflight_ref() );
+
 // 5. Sandbox trên site production: khách không thấy cổng, quản trị viên vẫn thấy.
 $prev = wp_get_current_user()->ID;
 wp_set_current_user( 0 );
@@ -220,6 +322,15 @@ hth_appotapay_schedule_reconcile();
 $jobs = as_get_scheduled_actions( [ 'hook' => HTH_APPOTAPAY_RECONCILE_HOOK, 'status' => ActionScheduler_Store::STATUS_PENDING ] );
 $job  = reset( $jobs );
 $check( 'Bật plugin: đúng một lịch, 10 phút một lần', 1 === count( $jobs ) && 600 === $job->get_schedule()->get_recurrence() );
+
+// admin_init chỉ kiểm lịch khi phiên bản đổi, để không query Action Scheduler ở mọi request wp-admin.
+hth_appotapay_unschedule_reconcile();
+update_option( 'hth_appotapay_version', HTH_APPOTAPAY_VERSION, false );
+hth_appotapay_admin_init();
+$check( 'admin_init khi phiên bản đã ghi: không đụng tới lịch', ! as_has_scheduled_action( HTH_APPOTAPAY_RECONCILE_HOOK ) );
+delete_option( 'hth_appotapay_version' );
+hth_appotapay_admin_init();
+$check( 'admin_init khi phiên bản mới: đăng ký bù lịch và ghi phiên bản', as_has_scheduled_action( HTH_APPOTAPAY_RECONCILE_HOOK ) && HTH_APPOTAPAY_VERSION === get_option( 'hth_appotapay_version' ) );
 
 $with_ref = function ( string $status = 'pending', array $props = [] ) use ( $new_order ) {
 	$o   = $new_order();
@@ -295,6 +406,33 @@ delete_option( 'hth_appotapay_lock_' . $busy_id );
 $run();
 $check( 'Gỡ khoá xong: lượt sau xác nhận được', wc_get_order( $busy_id )->is_paid() );
 
+// Mỗi đơn chỉ tra 2 mã mới nhất; mã tạo quá 2 giờ mà vẫn pending thì coi là hết hạn, không tra nữa.
+$o        = $new_order();
+$older    = $px . $o->get_id() . 'T' . ( time() - 4 * HOUR_IN_SECONDS ) . '111';
+$expired  = $px . $o->get_id() . 'T' . ( time() - 3 * HOUR_IN_SECONDS ) . '222';
+$fresh    = $px . $o->get_id() . 'T' . ( time() - 60 ) . '333';
+$o->update_meta_data( '_hth_appotapay_refs', [ $older, $expired, $fresh ] );
+$o->set_status( 'pending' );
+$o->save();
+$asked1 = $run();
+$asked2 = $run();
+$check( 'Chỉ tra 2 mã mới nhất của đơn', in_array( $fresh, $asked1, true ) && in_array( $expired, $asked1, true ) && ! in_array( $older, $asked1, true ) );
+$check( 'Mã quá 2 giờ vẫn pending: ghi vào final, lượt sau không tra', in_array( $expired, (array) wc_get_order( $o->get_id() )->get_meta( '_hth_appotapay_final_refs' ), true ) && ! in_array( $expired, $asked2, true ) );
+$check( 'Mã mới vẫn pending: lượt sau tra tiếp', in_array( $fresh, $asked2, true ) && ! in_array( $fresh, (array) wc_get_order( $o->get_id() )->get_meta( '_hth_appotapay_final_refs' ), true ) );
+$state[ $expired ] = 'success';
+$run();
+$check( 'Mã đã hết hạn không được tra lại dù API đổi ý', ! wc_get_order( $o->get_id() )->is_paid() );
+
+// Quá ngân sách thời gian: dừng lượt sau đơn đang tra, đơn còn lại tới lượt sau.
+$budget = fn() => 0;
+add_filter( 'hth_appotapay_reconcile_budget', $budget );
+$asked  = $run();
+remove_filter( 'hth_appotapay_reconcile_budget', $budget );
+$asked_orders = array_unique( array_map( function ( $r ) use ( $px ) {
+	return preg_match( '/^' . $px . '(\d+)T/', $r, $m ) ? $m[1] : '';
+}, $asked ) );
+$check( 'Ngân sách thời gian 0 giây: chỉ tra đúng một đơn rồi dừng', 1 === count( $asked_orders ) && count( $asked ) <= 2 );
+
 // Chưa nhập khoá: không gọi API.
 $saved               = $g->settings['api_key'];
 $g->settings['api_key'] = '';
@@ -304,6 +442,16 @@ $g->settings['api_key'] = $saved;
 $check( 'Chưa cấu hình khoá: không tra', [] === $asked );
 
 $cleanup();
+
+// 7. Gỡ plugin: uninstall.php xoá option cài đặt, phiên bản và khoá lẻ. Sao lưu rồi trả lại để site thử vẫn chạy.
+$settings_backup = get_option( 'woocommerce_hth_appotapay_settings' );
+update_option( 'hth_appotapay_lock_999999', time(), false );
+defined( 'WP_UNINSTALL_PLUGIN' ) || define( 'WP_UNINSTALL_PLUGIN', true );
+include dirname( __DIR__ ) . '/uninstall.php';
+$check( 'uninstall.php: xoá option cài đặt, phiên bản, khoá lẻ và lịch', false === get_option( 'woocommerce_hth_appotapay_settings' ) && false === get_option( 'hth_appotapay_version' ) && false === get_option( 'hth_appotapay_lock_999999' ) && ! as_has_scheduled_action( HTH_APPOTAPAY_RECONCILE_HOOK ) );
+false !== $settings_backup && update_option( 'woocommerce_hth_appotapay_settings', $settings_backup, 'yes' );
+hth_appotapay_admin_init();
+$check( 'Trả lại cài đặt và lịch sau khi thử uninstall', $settings_backup === get_option( 'woocommerce_hth_appotapay_settings' ) && as_has_scheduled_action( HTH_APPOTAPAY_RECONCILE_HOOK ) );
 
 WP_CLI::line( implode( "\n", $results ) );
 $fails = count( array_filter( $results, fn( $l ) => 0 === strpos( $l, 'FAIL' ) ) );

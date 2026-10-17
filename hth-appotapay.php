@@ -3,7 +3,7 @@
  * Plugin Name: HTH AppotaPay
  * Plugin URI: https://github.com/hanthienhai/hth-appotapay
  * Description: Cổng thanh toán AppotaPay (hosted checkout v2) cho WooCommerce.
- * Version: 0.2.0
+ * Version: 0.2.1
  * Author: hanthienhai
  * Author URI: https://github.com/hanthienhai
  * License: GPL-2.0-or-later
@@ -17,6 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
+define( 'HTH_APPOTAPAY_VERSION', '0.2.1' );
 define( 'HTH_APPOTAPAY_DIR', __DIR__ );
 define( 'HTH_APPOTAPAY_RECONCILE_HOOK', 'hth_appotapay_reconcile' );
 
@@ -67,7 +68,19 @@ function hth_appotapay_unschedule_reconcile(): void {
 	}
 }
 
+/**
+ * Chép đè bản mới lên plugin đang bật thì không chạy lại hook kích hoạt: tự đăng ký bù khi vào wp-admin.
+ * Chỉ kiểm một lần cho mỗi phiên bản (as_has_scheduled_action là một query lên bảng Action Scheduler)
+ * và bỏ qua admin-ajax, nơi heartbeat và WooCommerce gọi rất dày.
+ */
+function hth_appotapay_admin_init(): void {
+	if ( wp_doing_ajax() || ! function_exists( 'as_has_scheduled_action' ) || HTH_APPOTAPAY_VERSION === get_option( 'hth_appotapay_version' ) ) {
+		return;
+	}
+	hth_appotapay_schedule_reconcile();
+	update_option( 'hth_appotapay_version', HTH_APPOTAPAY_VERSION, false );
+}
+
 register_activation_hook( __FILE__, 'hth_appotapay_schedule_reconcile' );
 register_deactivation_hook( __FILE__, 'hth_appotapay_unschedule_reconcile' );
-// Chép đè bản mới lên plugin đang bật thì không chạy lại hook kích hoạt: tự đăng ký bù khi vào wp-admin.
-add_action( 'admin_init', 'hth_appotapay_schedule_reconcile' );
+add_action( 'admin_init', 'hth_appotapay_admin_init' );

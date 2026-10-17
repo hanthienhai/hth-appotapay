@@ -25,6 +25,15 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	/** Số đơn tối đa mỗi lượt tra lại định kỳ, để không dồn lệnh gọi API. */
 	const RECONCILE_LIMIT = 10;
 
+	/** Số giây tối đa một lượt tra lại được chạy: quá thì dừng, đơn còn lại tới lượt sau. */
+	const RECONCILE_BUDGET = 20;
+
+	/** Mỗi đơn chỉ tra chừng này mã tham chiếu mới nhất; mã cũ hơn là các lần bấm thanh toán đã bỏ. */
+	const RECONCILE_REFS = 2;
+
+	/** Phiên thanh toán AppotaPay sống 30 phút; mã tạo quá 2 giờ mà vẫn pending thì chắc chắn đã hết hạn. */
+	const REF_MAX_AGE = 2 * HOUR_IN_SECONDS;
+
 	const CONSTANTS = [
 		'partner_code' => 'HTH_APPOTAPAY_PARTNER_CODE',
 		'api_key'      => 'HTH_APPOTAPAY_API_KEY',
@@ -113,7 +122,7 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 				'type'        => 'checkbox',
 				'label'       => 'Ghi log request/response (WooCommerce → Trạng thái → Nhật ký, nguồn hth-appotapay)',
 				'default'     => 'no',
-				'description' => 'Log chứa số thẻ đã che và tên chủ thẻ. Chỉ bật khi dò lỗi.',
+				'description' => 'Link thanh toán, số thẻ và tên chủ thẻ được che trước khi ghi. Chỉ bật khi dò lỗi.',
 			],
 		];
 
@@ -123,6 +132,14 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 				$this->form_fields[ $key ]['description'] = "Đang dùng hằng số $const trong wp-config.php.";
 			}
 		}
+	}
+
+	/** Khoá đã đặt bằng hằng số thì giá trị cũ trong DB không được in ra trang cài đặt (WooCommerce in cả giá trị ô password). */
+	public function get_option( $key, $empty_value = null ) {
+		if ( isset( self::CONSTANTS[ $key ] ) && defined( self::CONSTANTS[ $key ] ) ) {
+			return '';
+		}
+		return parent::get_option( $key, $empty_value );
 	}
 
 	private function credential( string $key ): string {
@@ -195,16 +212,30 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 		return $order;
 	}
 
-	/** Khoá theo đơn, tự hết hạn sau 60 giây để một tiến trình chết giữa chừng không khoá đơn mãi mãi. */
+	/** Mã tham chiếu mang giờ tạo: ...T<unix time><3 số ngẫu nhiên>. Trả 0 nếu không đọc được. */
+	private static function ref_time( string $ref ): int {
+		return preg_match( '/T(\d{9,10})\d{3}$/', $ref, $m ) ? (int) $m[1] : 0;
+	}
+
+	/**
+	 * Khoá theo đơn, tự hết hạn sau 60 giây để một tiến trình chết giữa chừng không khoá đơn mãi mãi.
+	 * Ghi thẳng vào wp_options vì add_option() đọc trước rồi mới ghi, hai tiến trình (IPN và trang khách quay về)
+	 * có thể cùng lọt qua. INSERT IGNORE dựa vào UNIQUE KEY option_name nên chỉ một bên được 1 dòng.
+	 */
 	private static function lock( int $order_id ): bool {
+		global $wpdb;
 		$key = 'hth_appotapay_lock_' . $order_id;
-		if ( add_option( $key, time(), '', false ) ) {
+		$now = time();
+		$got = $wpdb->query( $wpdb->prepare( "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')", $key, (string) $now ) );
+		if ( 1 === $got ) {
+			wp_cache_delete( $key, 'options' );
 			return true;
 		}
-		$since = (int) get_option( $key );
-		if ( $since && time() - $since > 60 ) {
-			delete_option( $key );
-			return add_option( $key, time(), '', false );
+		// Khoá kẹt từ tiến trình chết: giành lại bằng một UPDATE có điều kiện, cũng nguyên tử.
+		$took = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value < %d", (string) $now, $key, $now - 60 ) );
+		if ( 1 === $took ) {
+			wp_cache_delete( $key, 'options' );
+			return true;
 		}
 		return false;
 	}
@@ -320,6 +351,9 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	 * Chạy 10 phút một lần qua Action Scheduler: tra lại các đơn AppotaPay chưa trả trong 24 giờ gần nhất,
 	 * phòng khi khách đóng tab và cả 3 lần IPN đều không tới. Đơn huỷ cũng tra, vì WooCommerce tự huỷ
 	 * đơn khi hết giờ giữ hàng dù khách có thể đã trả; payment_complete() nhận cả đơn huỷ và đơn lỗi. Dùng chung reconcile() (khoá và mọi kiểm tra) với IPN.
+	 *
+	 * Giữ lượt nhẹ: mỗi đơn chỉ tra RECONCILE_REFS mã mới nhất; mã quá REF_MAX_AGE mà vẫn pending thì coi là hết hạn
+	 * (API AppotaPay không có trạng thái "hết hạn", pending mãi); quá RECONCILE_BUDGET giây thì dừng, đơn còn lại tới lượt sau.
 	 */
 	public function reconcile_recent(): void {
 		if ( ! $this->client()->is_configured() ) {
@@ -334,10 +368,12 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			'order'          => 'ASC',
 			'limit'          => max( 1, (int) apply_filters( 'hth_appotapay_reconcile_limit', self::RECONCILE_LIMIT ) ),
 		] );
+		$deadline = microtime( true ) + max( 0, (float) apply_filters( 'hth_appotapay_reconcile_budget', self::RECONCILE_BUDGET ) );
 
 		foreach ( $orders as $order ) {
 			$final = array_filter( (array) $order->get_meta( self::META_FINAL_REFS ) );
-			foreach ( array_reverse( array_filter( (array) $order->get_meta( self::META_REFS ) ) ) as $ref ) {
+			$refs  = array_slice( array_reverse( array_filter( (array) $order->get_meta( self::META_REFS ) ) ), 0, self::RECONCILE_REFS );
+			foreach ( $refs as $ref ) {
 				if ( in_array( $ref, $final, true ) ) {
 					continue;
 				}
@@ -346,25 +382,34 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 					break;
 				}
 				// Giao dịch thất bại không đổi kết quả nữa: nhớ lại để khỏi tra và ghi chú lặp mỗi 10 phút.
-				if ( 'error' === $state ) {
+				// Mã tạo quá lâu mà vẫn pending: phiên đã hết hạn, cũng không đổi kết quả nữa.
+				$created = self::ref_time( $ref );
+				if ( 'error' === $state || ( 'pending' === $state && $created && time() - $created > self::REF_MAX_AGE ) ) {
 					$final[] = $ref;
 				}
 			}
 			$order = wc_get_order( $order->get_id() );
 			if ( $final ) {
-				$order->update_meta_data( self::META_FINAL_REFS, $final );
+				$order->update_meta_data( self::META_FINAL_REFS, array_values( $final ) );
 			}
 			$order->update_meta_data( self::META_CHECKED_AT, time() );
 			$order->save();
+
+			if ( microtime( true ) > $deadline ) {
+				$this->log( 'Tra lại định kỳ: quá ' . self::RECONCILE_BUDGET . ' giây, dừng lượt; đơn còn lại tới lượt sau.' );
+				break;
+			}
 		}
 	}
 
 	/** IPN: AppotaPay POST JSON { data, signature, time }, chỉ gửi khi giao dịch thành công. */
 	public function handle_ipn() {
 		$body    = json_decode( (string) file_get_contents( 'php://input' ), true );
-		$payload = $this->client()->verify_callback( $body['data'] ?? null, $body['signature'] ?? null );
+		$time    = $body['time'] ?? null;
+		$payload = $this->client()->verify_callback( $body['data'] ?? null, $body['signature'] ?? null, $time );
 		if ( null === $payload ) {
-			$this->log( 'IPN sai chữ ký từ ' . WC_Geolocation::get_ip_address() );
+			$why = HTH_AppotaPay_Client::is_fresh( $time ) ? 'sai chữ ký' : 'quá cũ hoặc thiếu time (' . ( is_scalar( $time ) ? $time : gettype( $time ) ) . ')';
+			$this->log( "IPN $why, từ " . WC_Geolocation::get_ip_address() );
 			wp_send_json( [ 'status' => 'invalid signature' ], 400 );
 		}
 
@@ -387,8 +432,18 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 
 	/** Khách quay về từ AppotaPay: GET ?data=&signature=&time=. Chỉ để hiển thị, đơn vẫn chốt qua API. */
 	public function handle_return() {
-		$payload = $this->client()->verify_callback( wp_unslash( $_GET['data'] ?? '' ), wp_unslash( $_GET['signature'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification
-		$order   = $payload ? $this->order_from_ref( $payload['partnerReference']['order']['id'] ?? '' ) : null;
+		// phpcs:disable WordPress.Security.NonceVerification
+		$time = wp_unslash( $_GET['time'] ?? '' );
+		if ( ! HTH_AppotaPay_Client::is_fresh( $time ) ) {
+			// Link quay về cũ (lịch sử trình duyệt, referrer): không tra API, không đưa tới trang đơn kèm key.
+			$this->log( 'Trang trả về: callback quá cũ hoặc thiếu time, IP ' . WC_Geolocation::get_ip_address() );
+			wc_add_notice( 'Kết quả thanh toán này đã quá hạn. Nếu bạn đã trả, đơn sẽ tự cập nhật; nếu chưa, hãy đặt lại.', 'error' );
+			wp_safe_redirect( wc_get_checkout_url() );
+			exit;
+		}
+		$payload = $this->client()->verify_callback( wp_unslash( $_GET['data'] ?? '' ), wp_unslash( $_GET['signature'] ?? '' ), $time );
+		// phpcs:enable WordPress.Security.NonceVerification
+		$order = $payload ? $this->order_from_ref( $payload['partnerReference']['order']['id'] ?? '' ) : null;
 
 		if ( ! $order ) {
 			$this->log( 'Trang trả về: chữ ký sai hoặc mã đơn lạ, IP ' . WC_Geolocation::get_ip_address() );
@@ -455,9 +510,12 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			'reason'        => mb_substr( $reason ?: 'Hoan tien don hang #' . $order->get_order_number(), 0, 100 ),
 		] );
 
-		if ( 0 === $code ) {
-			$order->add_order_note( "AppotaPay: mất kết nối khi gửi lệnh hoàn $ref, chưa rõ kết quả. Lần hoàn sau plugin sẽ tra lệnh này trước." );
-			return new WP_Error( 'appotapay_refund', 'Mất kết nối với AppotaPay, chưa rõ đã hoàn hay chưa. Đừng làm gì thêm; thử lại sau ít phút để plugin tra kết quả.' );
+		// Mất mạng, lỗi phía máy chủ (5xx, kể cả 502/504 từ proxy) hay body không phải JSON: AppotaPay có thể đã nhận lệnh.
+		// Giữ META_REFUND_INFLIGHT để lần hoàn sau tra lệnh này trước; chỉ xoá khi có phản hồi JSON hợp lệ 2xx/4xx.
+		if ( 0 === $code || $code >= 500 || null === $res ) {
+			$why = 0 === $code ? 'mất kết nối' : "AppotaPay trả HTTP $code" . ( null === $res ? ' không có JSON' : '' );
+			$order->add_order_note( "AppotaPay: $why khi gửi lệnh hoàn $ref, chưa rõ kết quả. Lần hoàn sau plugin sẽ tra lệnh này trước." );
+			return new WP_Error( 'appotapay_refund', 'AppotaPay không trả lời rõ ràng, chưa rõ đã hoàn hay chưa. Đừng làm gì thêm; thử lại sau ít phút để plugin tra kết quả.' );
 		}
 
 		$order->delete_meta_data( self::META_REFUND_INFLIGHT );
