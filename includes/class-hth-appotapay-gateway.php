@@ -393,6 +393,8 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 				$order->update_meta_data( self::META_FINAL_REFS, array_values( $final ) );
 			}
 			$order->update_meta_data( self::META_CHECKED_AT, time() );
+			// Kho đơn cổ điển (HPOS tắt) không đổi post_modified khi chỉ lưu meta; ép đổi để đơn vừa tra xuống cuối hàng ở cả hai kiểu kho.
+			$order->set_date_modified( time() );
 			$order->save();
 
 			if ( microtime( true ) > $deadline ) {

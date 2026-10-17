@@ -332,18 +332,25 @@ delete_option( 'hth_appotapay_version' );
 hth_appotapay_admin_init();
 $check( 'admin_init khi phiên bản mới: đăng ký bù lịch và ghi phiên bản', as_has_scheduled_action( HTH_APPOTAPAY_RECONCILE_HOOK ) && HTH_APPOTAPAY_VERSION === get_option( 'hth_appotapay_version' ) );
 
-$with_ref = function ( string $status = 'pending', array $props = [] ) use ( $new_order ) {
+$with_ref = function ( string $status = 'pending', array $props = [] ) use ( $new_order, $px ) {
 	$o   = $new_order();
 	$ref = $px . $o->get_id() . 'T1';
 	$o->update_meta_data( '_hth_appotapay_refs', [ $ref ] );
 	$o->set_props( $props );
 	$o->set_status( $status );
 	$o->save();
+	// Kho cổ điển (HPOS tắt): wp_update_post luôn ghi post_modified = bây giờ, nên phải đặt mốc quá khứ thẳng vào bảng posts.
+	if ( isset( $props['date_modified'] ) ) {
+		global $wpdb;
+		$ts = (int) $props['date_modified'];
+		$wpdb->update( $wpdb->posts, [ 'post_modified' => get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $ts ) ), 'post_modified_gmt' => gmdate( 'Y-m-d H:i:s', $ts ) ], [ 'ID' => $o->get_id() ] );
+		clean_post_cache( $o->get_id() );
+	}
 	return [ $o->get_id(), $ref ];
 };
 $asked = []; // mã tham chiếu đã tra trong lượt
 $state = []; // mã tham chiếu => success | error; còn lại API báo pending
-$mock  = function ( $m, $url ) use ( &$asked, &$state ) {
+$mock  = function ( $m, $url ) use ( &$asked, &$state, $px ) {
 	parse_str( (string) wp_parse_url( $url, PHP_URL_QUERY ), $q );
 	$ref     = $q['referenceId'] ?? '';
 	$asked[] = $ref;
@@ -371,7 +378,8 @@ $first  = $run();
 $second = $run();
 remove_filter( 'hth_appotapay_reconcile_limit', $limit );
 $check( 'Mỗi lượt chỉ tra tới giới hạn số đơn', [ $g1[1], $g2[1] ] === $first && count( $second ) <= 2 );
-$check( 'Lượt sau tra tới đơn chưa được tra', in_array( $g3[1], $second, true ) && ! in_array( $g1[1], $second, true ) );
+// Sau lượt 1, g1 và g2 bị đẩy xuống cuối hàng nên g3 (chưa tra) phải đứng đầu lượt 2; ô còn lại là g1 hoặc g2 tuỳ cách DB xếp khi hoà giờ.
+$check( 'Lượt sau tra tới đơn chưa được tra', 2 === count( $second ) && $g3[1] === $second[0] );
 
 [ $paid_id, $paid_ref ]         = $with_ref();
 [ $cancel_id, $cancel_ref ]     = $with_ref( 'cancelled' );

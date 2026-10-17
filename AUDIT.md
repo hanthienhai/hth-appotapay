@@ -1,13 +1,13 @@
 # Kiểm toán bảo mật plugin hth-appotapay
 
-Ngày: 15/10/2026, bổ sung 17/10/2026 (mục 16–24) · Phiên bản: 0.2.1 · Môi trường thử: WordPress 7.1.3, PHP 8.2, WooCommerce 11.2.1, HPOS bật, chạy trên WordPress Studio với dữ liệu của một shop thật
+Ngày: 15/10/2026, bổ sung 17/10/2026 (mục 16–25) · Phiên bản: 0.2.1 · Môi trường thử: WordPress 7.1.3, PHP 8.2.34, WooCommerce 11.2.1, chạy trên WordPress Studio. Đợt 15/10 thử với HPOS bật trên dữ liệu của một shop thật; đợt 17/10 thử trên site trắng (Studio CLI 1.24.0) ở cả HPOS bật và tắt, môi trường local và production
 
 ## Phạm vi và cách làm
 
 - Đọc từng dòng hai tệp `includes/class-hth-appotapay-client.php` và `includes/class-hth-appotapay-gateway.php`, rồi đi theo từng đường mà kẻ xấu hoặc sự cố có thể chạm tới: tạo giao dịch, IPN, trang khách quay về, đối soát, tra lại định kỳ, hoàn tiền, cài đặt.
 - So code với skill chính thức `AppotaPayInc/skills` (appotapay-auth, appotapay-payment). Đối chiếu tài liệu live trên docs.appotapay.com ngày 15/10/2026: trùng khớp với bản chụp trong skill.
 - Bộ thử `tests/run.php` giả lập phản hồi AppotaPay qua `pre_http_request`. Bản 0.2.0: 51 bài ở môi trường local và 52 bài ở production (thêm một bài cho chế độ sandbox), đạt hết ở cả hai. Thêm vào đó là các lần gọi HTTP thật tới sandbox và một lần trả tiền thật bằng thẻ test.
-- Đợt 17/10/2026 rà lại lần hai bằng cách đọc mã và đối chiếu tài liệu live (`/payment/result`, `/payment/payment-status`, `/payment/refund`), tìm thêm 2 lỗi mức Vừa và 7 điểm Thấp (mục 16–24). Bộ thử tăng lên 85 bài ở local, 86 ở production, cộng 1 bài cho mỗi hằng số `wp-config.php` đã đặt.
+- Đợt 17/10/2026 rà lại lần hai bằng cách đọc mã và đối chiếu tài liệu live (`/payment/result`, `/payment/payment-status`, `/payment/refund`), tìm thêm 2 lỗi mức Vừa và 7 điểm Thấp (mục 16–24). Bộ thử tăng lên 85 bài ở local, 86 ở production, cộng 1 bài cho mỗi hằng số `wp-config.php` đã đặt. Chạy bộ thử trên site trắng ở kho cổ điển (HPOS tắt) lộ thêm mục 25; sau khi sửa, đạt 85/85 ở local với HPOS bật lẫn tắt và 86/86 ở production.
 
 Chạy lại bộ thử:
 
@@ -43,6 +43,7 @@ studio wp eval-file wp-content/plugins/hth-appotapay/tests/run.php
 | 22 | Thấp | Log ghi nguyên body phản hồi: `payment.url` của giao dịch đang chờ, số thẻ đã che, tên chủ thẻ | Ai đọc được log mở được link thanh toán của đơn khách đang chờ | Che `payment.url`, `cardNumber`, `cardName`, `tokenInfo.number/holder_name/token` trước khi ghi; body không phải JSON chỉ ghi 300 ký tự đầu | "Log che link thanh toán…", "Log vẫn ghi mã giao dịch…", "Body không phải JSON…" |
 | 23 | Thấp | Đã đặt hằng số trong `wp-config.php` nhưng ô Secret Key (dù `disabled`) vẫn in giá trị cũ trong DB vào HTML | Secret Key cũ lộ trong trang cài đặt cho mọi tài khoản `manage_woocommerce`, trái với mục đích của hằng số | `get_option()` của gateway trả rỗng cho 3 khoá khi hằng số tương ứng đã có | "Hằng số … đã đặt: trang cài đặt không in giá trị DB" (chỉ chạy khi site có hằng số) |
 | 24 | Thấp | Thiếu `uninstall.php` | Gỡ plugin để lại `woocommerce_hth_appotapay_settings` (có Secret Key nếu không dùng hằng số) và các option `hth_appotapay_lock_*` lẻ | Thêm `uninstall.php` xoá option cài đặt, option phiên bản, mọi `hth_appotapay_lock_*` và lịch tra lại. Meta trên đơn giữ lại làm lịch sử | 2 bài mục 7 |
+| 25 | Vừa | Hàng đợi tra lại không chạy ở kho đơn cổ điển (HPOS tắt) | Lượt tra lại xếp đơn theo `date_modified` để đơn vừa tra xuống cuối hàng. Kho cổ điển không đổi `post_modified` khi chỉ lưu meta, nên cùng 10 đơn treo cũ nhất được tra mãi, đơn mới hơn không bao giờ tới lượt. Đợt 15/10 chỉ thử với HPOS bật nên không thấy | Sau mỗi lượt gọi `set_date_modified( time() )` trước khi `save()`, chạy đúng ở cả hai kiểu kho. Bộ thử đặt mốc quá khứ thẳng vào bảng `posts` vì `wp_update_post` luôn ghi `post_modified` = bây giờ | "Lượt sau tra tới đơn chưa được tra", chạy với HPOS tắt |
 
 ## Những gì đã đúng từ đầu
 
