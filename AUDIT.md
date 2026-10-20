@@ -80,3 +80,22 @@ Chưa sửa trong code, cần biết trước khi chạy thật:
 - [ ] Đóng gói bằng `git archive --format=zip -o hth-appotapay.zip --prefix=hth-appotapay/ HEAD`. Gói này bỏ sẵn `.git/` và `tests/`. Đừng chép nguyên thư mục, vì OLS sẽ để lộ `.git/` ra web.
 - [ ] Trả thử một đơn nhỏ bằng thẻ thật, rồi hoàn tiền chính đơn đó để kiểm cả hai chiều.
 - [ ] Bật "Ghi log" cho vài giao dịch đầu, xem IPN và trang quay về được nhận (không có dòng "quá cũ hoặc thiếu time"), rồi tắt.
+
+## Đợt 20/10/2026 — bản 0.3.0 (đơn bằng tiền tệ khác VND)
+
+Phạm vi: đọc lại toàn bộ `class-hth-appotapay-client.php` (không đổi so với 0.2.1) và `class-hth-appotapay-gateway.php`, tập trung vào phần mới: `rate()`, `to_vnd()`, `order_vnd()`, `context_total()`, `get_title()/get_description()`, và các chỗ `process_payment()`, `reconcile()`, `process_refund()` dùng số VND đã ghi. Rà đầu vào thô (`$_GET/$_POST/$_COOKIE`): chỉ còn ở `handle_return()` và đã qua kiểm chữ ký như trước. Bộ thử 109 ca, đạt hết trên Studio (WordPress 7.1, WooCommerce 11.2.1, WOOCS 2.4.5, Polylang Pro 3.7.1), kèm một lần thử tay ra trang sandbox với đúng số VND.
+
+| # | Mức | Lỗi | Hậu quả nếu để nguyên | Cách sửa | Bài thử |
+|---|---|---|---|---|---|
+| 26 | Thấp | `context_total()` đọc đơn từ `order-pay` trong URL mà không kiểm khoá đơn | Ai gõ URL `/order-pay/<id>/` với id của người khác không xem được gì (WooCommerce không vẽ form khi sai khoá), nhưng plugin vẫn đọc tổng và tiền tệ của đơn đó để dựng mô tả. Không rò rỉ ra ngoài, song là một chỗ tin đầu vào thừa | Chỉ nhận đơn khi `key` trong URL khớp `get_order_key()` (so hằng thời gian), như WooCommerce làm trước khi vẽ form | "Trang order-pay không có khoá đơn đúng…" |
+| 27 | Vừa (cấu hình cửa hàng, ngoài plugin) | WooCommerce "Số thập phân" = 0 trong khi WOOCS hiện USD/PHP có lẻ | Mọi đơn USD/PHP lưu tổng số nguyên: giỏ $15,18 thành đơn $15, món 20.000 ₫ ($0,76) thành $1. Món dưới 13.175 ₫ (0,5 USD) sẽ về $0 và WooCommerce coi là đơn miễn phí, không cần thanh toán. Plugin tính VND trên số WooCommerce sẽ lưu, nên số hiện ở checkout bằng số thu; không chữa được gốc | Khuyến nghị đặt "Số thập phân" = 2 (WOOCS vẫn hiện VND không lẻ theo cài đặt riêng từng tiền tệ). Trước khi đổi, thử trên bản local vì ảnh hưởng mọi cổng và báo cáo. Hiện catalog không có món nào dưới 13.175 ₫ | Kiểm tay |
+| 28 | Ghi nhận | Đổi tỷ giá WOOCS giữa hai lần bấm thanh toán của cùng đơn | Khách trả theo mã cũ với số VND cũ; `reconcile()` so với số VND của lần bấm mới nhất, thấy lệch → chuyển "tạm giữ" kèm ghi chú, không xác nhận và không mất tiền | Giữ nguyên; đây là hành vi an toàn có chủ ý | "API báo 144 thay vì số VND…" |
+| 29 | Ghi nhận | Meta `_woocs_order_rate` do WOOCS ghi vào đơn sai ở hơn nửa số đơn thực tế | Nếu quy đổi theo meta này, khách bị thu sai tới hàng chục phần trăm | Plugin lấy tỷ giá từ bảng tiền tệ WOOCS theo `get_currency()` của đơn, không đọc meta | "Tỷ giá: VND = 1, USD/PHP từ bảng WOOCS…" |
+
+Đã rà và không thấy vấn đề:
+
+- Tiêu đề/mô tả cho tiền tệ khác VND là text do quản trị viên nhập qua WooCommerce Settings API (được lọc như ô `title`/`description` cũ); `{total}` lấy từ `wc_price()` đã bỏ thẻ HTML, `{vnd}` là số.
+- Tiền tệ của đơn do WooCommerce xác thực theo danh sách ISO khi `set_currency()`, nên không mang HTML vào thông báo lỗi hay ghi chú.
+- Tỷ giá từ filter `hth_appotapay_vnd_rate` phải là số dương, nếu không thì cổng ẩn / từ chối tạo giao dịch.
+- Hoàn tiền: số VND hoàn không bao giờ vượt số đã thu (sổ `_hth_appotapay_refunded`); hoàn nốt phần còn lại thì hoàn đúng số VND còn lại; lệnh treo vẫn được tra trước như mục 2 và 16.
+- Giới hạn 1.000–500.000.000 ₫ kiểm trên số VND quy đổi; đơn dưới 1.000 ₫ bị từ chối trước khi gọi API.

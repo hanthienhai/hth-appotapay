@@ -249,7 +249,10 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	private static function context_total(): ?array {
 		$order_id = function_exists( 'is_wc_endpoint_url' ) && is_wc_endpoint_url( 'order-pay' ) ? absint( get_query_var( 'order-pay' ) ) : 0;
 		$order    = $order_id ? wc_get_order( $order_id ) : null;
-		if ( $order ) {
+		// Chỉ tin đơn trong URL khi kèm đúng khoá, như WooCommerce làm trước khi vẽ form trả đơn; không thì không đọc tổng của đơn người khác.
+		// phpcs:ignore WordPress.Security.NonceVerification
+		$key = isset( $_GET['key'] ) ? wc_clean( wp_unslash( $_GET['key'] ) ) : '';
+		if ( $order && '' !== $key && hash_equals( $order->get_order_key(), $key ) ) {
 			return [ (float) $order->get_total(), $order->get_currency(), wp_strip_all_tags( $order->get_formatted_order_total() ) ];
 		}
 		if ( function_exists( 'WC' ) && WC()->cart ) {

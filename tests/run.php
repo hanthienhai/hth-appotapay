@@ -494,10 +494,12 @@ $vnd = HTH_AppotaPay_Gateway::to_vnd( 144, 'USD' )[0];
 global $wp;
 $wp->query_vars['order-pay'] = $o->get_id();
 set_query_var( 'order-pay', $o->get_id() );
+$check( 'Trang order-pay không có khoá đơn đúng: không đọc đơn, mô tả thường', $g->get_option( 'description' ) === $g->get_description() );
+$_GET['key'] = $o->get_order_key();
 $desc = $g->get_description();
 $check( 'Trang order-pay đơn USD: hiện cổng dù tiền tệ hiện tại là VND', $g->is_available() && $g->get_option( 'title_foreign' ) === $g->get_title() );
 $check( 'Mô tả điền {vnd} và {total}, không còn placeholder', false !== strpos( $desc, HTH_AppotaPay_Gateway::format_vnd( $vnd ) ) && false !== strpos( $desc, '144' ) && false === strpos( $desc, '{' ) );
-unset( $wp->query_vars['order-pay'] );
+unset( $wp->query_vars['order-pay'], $_GET['key'] );
 set_query_var( 'order-pay', null );
 $check( 'Rời trang order-pay: mô tả thường', $g->get_option( 'description' ) === $g->get_description() );
 
