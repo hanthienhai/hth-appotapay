@@ -26,6 +26,11 @@ add_filter( 'pre_http_request', function ( $pre, $args, $url ) use ( &$mock ) {
 }, 10, 3 );
 
 $g    = WC()->payment_gateways()->payment_gateways()['hth_appotapay'];
+// WOOCS nhớ tiền tệ hiện tại trong transient theo IP; trong WP-CLI mọi lượt chạy dùng chung một khoá, nên ép về VND trước khi tạo đơn thử.
+global $WOOCS;
+if ( is_object( $WOOCS ) && 'VND' !== $WOOCS->current_currency ) {
+	$WOOCS->set_currency( 'VND' );
+}
 $call = function ( string $method, ...$args ) use ( $g ) {
 	$m = new ReflectionMethod( $g, $method );
 	$m->setAccessible( true );
@@ -451,7 +456,122 @@ $check( 'Chưa cấu hình khoá: không tra', [] === $asked );
 
 $cleanup();
 
-// 7. Gỡ plugin: uninstall.php xoá option cài đặt, phiên bản và khoá lẻ. Sao lưu rồi trả lại để site thử vẫn chạy.
+// 7. Tiền tệ khác VND: quy đổi theo tỷ giá WOOCS, hiện cổng "Pay in VND", gửi/đối chiếu/hoàn đều bằng VND.
+global $WOOCS;
+$check( 'WOOCS có mặt với tiền tệ gốc VND (các ca dưới cần)', is_object( $WOOCS ) && 'VND' === $WOOCS->default_currency );
+$usd = (float) $WOOCS->get_currencies()['USD']['rate'];
+$php = (float) $WOOCS->get_currencies()['PHP']['rate'];
+$check( 'Tỷ giá: VND = 1, USD/PHP từ bảng WOOCS, tiền tệ lạ = null', 1.0 === HTH_AppotaPay_Gateway::rate( 'VND' ) && $usd === HTH_AppotaPay_Gateway::rate( 'USD' ) && $php === HTH_AppotaPay_Gateway::rate( 'PHP' ) && null === HTH_AppotaPay_Gateway::rate( 'XXX' ) );
+// Giá PHP khách thấy đã làm tròn 1 chữ số nên quy về VND có thể lệch vài đồng so với giá niêm yết (4.284.500 ₫ → 10.579 ₱ → 4.284.495 ₫).
+$check( 'Quy đổi làm tròn tới đồng: 7.616 PHP → 3.084.480 ₫, 10.579 PHP → 4.284.495 ₫', [ 3084480, $php ] === HTH_AppotaPay_Gateway::to_vnd( 7616, 'PHP' ) && 4284495 === HTH_AppotaPay_Gateway::to_vnd( 10579, 'PHP' )[0] );
+$rate_f = fn( $rate, $cur ) => 'XXX' === $cur ? 0.001 : $rate;
+add_filter( 'hth_appotapay_vnd_rate', $rate_f, 10, 2 );
+$check( 'Filter hth_appotapay_vnd_rate cấp tỷ giá cho tiền tệ ngoài WOOCS', 1000000 === HTH_AppotaPay_Gateway::to_vnd( 1000, 'XXX' )[0] );
+remove_filter( 'hth_appotapay_vnd_rate', $rate_f );
+
+// WOOCS quyết định get_woocommerce_currency() qua filter ưu tiên 9999 của nó, nên đổi bằng set_currency() rồi trả về VND ở cuối mục.
+$WOOCS->set_currency( 'USD' );
+$check( 'Tiền tệ hiện tại USD có tỷ giá: hiện cổng, tiêu đề là ô "khi tiền tệ khác VND"', $g->is_available() && $g->get_option( 'title_foreign' ) === $g->get_title() );
+$saved_tf                    = $g->settings['title_foreign'] ?? null;
+$g->settings['title_foreign'] = '';
+$check( 'Ô tiêu đề để trống: ẩn cổng với USD', ! $g->is_available() );
+null === $saved_tf ? ( function () use ( $g ) { unset( $g->settings['title_foreign'] ); } )() : $g->settings['title_foreign'] = $saved_tf;
+$WOOCS->set_currency( 'XXX' );
+$check( 'Tiền tệ không có trong WOOCS: ẩn cổng', ! $g->is_available() );
+$WOOCS->set_currency( 'VND' );
+$check( 'VND: vẫn hiện cổng với tiêu đề thường', 'VND' === get_woocommerce_currency() && $g->is_available() && $g->get_option( 'title' ) === $g->get_title() );
+
+$new_foreign = function ( string $cur, float $total ) use ( $new_order ) {
+	$o = $new_order();
+	$o->set_currency( $cur );
+	$o->set_total( $total );
+	$o->save();
+	return wc_get_order( $o->get_id() );
+};
+$o   = $new_foreign( 'USD', 144 );
+$vnd = HTH_AppotaPay_Gateway::to_vnd( 144, 'USD' )[0];
+// Giả lập trang order-pay của đơn này (khách trả lại đơn cũ): tiền tệ hiện tại là VND nhưng đơn là USD.
+global $wp;
+$wp->query_vars['order-pay'] = $o->get_id();
+set_query_var( 'order-pay', $o->get_id() );
+$desc = $g->get_description();
+$check( 'Trang order-pay đơn USD: hiện cổng dù tiền tệ hiện tại là VND', $g->is_available() && $g->get_option( 'title_foreign' ) === $g->get_title() );
+$check( 'Mô tả điền {vnd} và {total}, không còn placeholder', false !== strpos( $desc, HTH_AppotaPay_Gateway::format_vnd( $vnd ) ) && false !== strpos( $desc, '144' ) && false === strpos( $desc, '{' ) );
+unset( $wp->query_vars['order-pay'] );
+set_query_var( 'order-pay', null );
+$check( 'Rời trang order-pay: mô tả thường', $g->get_option( 'description' ) === $g->get_description() );
+
+$body = null;
+$mock = function ( $m, $url, $args ) use ( &$body ) {
+	$body = is_array( $args['body'] ?? null ) ? $args['body'] : json_decode( (string) ( $args['body'] ?? '' ), true );
+	return [ 200, [ 'transaction' => [ 'transactionId' => 'APU1' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+};
+$r = $g->process_payment( $o->get_id() );
+$o = wc_get_order( $o->get_id() );
+$check( 'Đơn USD: gửi AppotaPay số VND quy đổi, tiền tệ VND', 'success' === $r['result'] && $vnd === (int) ( $body['transaction']['amount'] ?? 0 ) && 'VND' === ( $body['transaction']['currency'] ?? '' ) );
+$check( 'Đơn USD: ghi số VND và tỷ giá vào đơn', $vnd === (int) $o->get_meta( '_hth_appotapay_vnd' ) && $usd === (float) $o->get_meta( '_hth_appotapay_rate' ) );
+$notes = wc_get_order_notes( [ 'order_id' => $o->get_id() ] );
+$check( 'Ghi chú nêu số VND thu và tỷ giá', false !== strpos( $notes[0]->content, 'Thu ' ) && false !== strpos( $notes[0]->content, 'USD' ) );
+$refs = (array) $o->get_meta( '_hth_appotapay_refs' );
+$ref  = end( $refs );
+$mock = fn() => $txn_ok( $ref, 144, 'TXU0' );
+$check( 'API báo 144 (số USD) thay vì số VND: không xác nhận, tạm giữ', 'error' === $call( 'reconcile', $o, $ref ) && 'on-hold' === wc_get_order( $o->get_id() )->get_status() );
+$mock = fn() => $txn_ok( $ref, $vnd, 'TXU1' );
+$check( 'API báo đúng số VND đã lưu: xác nhận đơn USD', 'success' === $call( 'reconcile', wc_get_order( $o->get_id() ), $ref ) && wc_get_order( $o->get_id() )->is_paid() );
+
+$o = $new_foreign( 'PHP', 7616 );
+$mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APP1' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+$g->process_payment( $o->get_id() );
+$o = wc_get_order( $o->get_id() );
+$check( 'Đơn PHP 7.616: ghi 3.084.480 ₫', 3084480 === (int) $o->get_meta( '_hth_appotapay_vnd' ) );
+$mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APP1' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+$rate_small = fn( $rate, $cur ) => 'PHP' === $cur ? 100.0 : $rate; // 1 PHP = 0,01 ₫ → đơn dưới 1.000 ₫
+add_filter( 'hth_appotapay_vnd_rate', $rate_small, 10, 2 );
+$check( 'Giới hạn 1.000 ₫ kiểm trên số VND quy đổi', 'failure' === $g->process_payment( $o->get_id() )['result'] );
+remove_filter( 'hth_appotapay_vnd_rate', $rate_small );
+$cur_none = fn( $rate, $cur ) => 'PHP' === $cur ? null : $rate;
+add_filter( 'hth_appotapay_vnd_rate', $cur_none, 10, 2 );
+$check( 'Mất tỷ giá lúc bấm thanh toán: từ chối, không gọi API', 'failure' === $g->process_payment( $o->get_id() )['result'] );
+remove_filter( 'hth_appotapay_vnd_rate', $cur_none );
+
+// Hoàn tiền đơn USD: số WooCommerce đưa vào là USD, lệnh gửi AppotaPay là VND.
+$o = $new_foreign( 'USD', 144 );
+$mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APU2' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+$g->process_payment( $o->get_id() );
+$o = wc_get_order( $o->get_id() );
+$o->payment_complete( 'TXU2' );
+$sent = [];
+$mock = function ( $m, $url, $args ) use ( &$sent ) {
+	$b      = is_array( $args['body'] ?? null ) ? $args['body'] : json_decode( (string) ( $args['body'] ?? '' ), true );
+	$sent[] = [ $m, $url, $b ];
+	return 'POST' === $m ? [ 200, [ 'status' => 'success', 'refundId' => 'RU' . count( $sent ) ] ] : [ 404, [ 'errorCode' => 36 ] ];
+};
+$part = (int) round( 50 / $usd );
+$r    = $g->process_refund( $o->get_id(), 50, 'test' );
+$led  = wc_get_order( $o->get_id() )->get_meta( '_hth_appotapay_refunded' );
+$check( 'Hoàn 50 USD: gửi lệnh hoàn ' . number_format( $part ) . ' ₫, ghi sổ', true === $r && $part === (int) ( $sent[0][2]['amount'] ?? 0 ) && 'VND' === ( $sent[0][2]['currency'] ?? '' ) && 50.0 === (float) $led['amount'] && $part === (int) $led['vnd'] );
+$sent = [];
+$r    = $g->process_refund( $o->get_id(), 94, 'test' );
+$check( 'Hoàn nốt 94 USD: hoàn đúng phần VND còn lại, không lệch làm tròn', true === $r && ( $vnd - $part ) === (int) ( $sent[0][2]['amount'] ?? 0 ) );
+$r = $g->process_refund( $o->get_id(), 10, 'test' );
+$check( 'Đã hoàn hết: từ chối, không gửi lệnh', is_wp_error( $r ) && 1 === count( $sent ) );
+$o = $new_foreign( 'USD', 144 );
+$mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APU3' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+$g->process_payment( $o->get_id() );
+$o = wc_get_order( $o->get_id() );
+$o->payment_complete( 'TXU3' );
+$sent = [];
+$mock = function ( $m, $url, $args ) use ( &$sent ) {
+	$b      = is_array( $args['body'] ?? null ) ? $args['body'] : json_decode( (string) ( $args['body'] ?? '' ), true );
+	$sent[] = [ $m, $url, $b ];
+	return 'POST' === $m ? [ 200, [ 'status' => 'success', 'refundId' => 'RU9' ] ] : [ 404, [ 'errorCode' => 36 ] ];
+};
+$r = $g->process_refund( $o->get_id(), 144, 'test' );
+$check( 'Hoàn trọn đơn USD một lần: đúng số VND đã thu', true === $r && $vnd === (int) ( $sent[0][2]['amount'] ?? 0 ) );
+$WOOCS->set_currency( 'VND' );
+$cleanup();
+
+// 8. Gỡ plugin: uninstall.php xoá option cài đặt, phiên bản và khoá lẻ. Sao lưu rồi trả lại để site thử vẫn chạy.
 $settings_backup = get_option( 'woocommerce_hth_appotapay_settings' );
 update_option( 'hth_appotapay_lock_999999', time(), false );
 defined( 'WP_UNINSTALL_PLUGIN' ) || define( 'WP_UNINSTALL_PLUGIN', true );

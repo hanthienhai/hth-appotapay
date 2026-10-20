@@ -6,6 +6,10 @@
  * và đưa khách về redirectUrl. Cả hai đường đều kiểm chữ ký rồi gọi API tra trạng thái;
  * đơn chỉ được xác nhận khi API báo success, đúng mã đơn, đúng số tiền và đúng tiền tệ.
  *
+ * AppotaPay chỉ thu VND. Đơn bằng tiền tệ khác (khách đổi tiền qua WOOCS) được quy về VND theo tỷ giá
+ * trong bảng tiền tệ của WOOCS: vnd = tổng đơn / rate. Số VND này ghi vào đơn lúc bấm thanh toán và là
+ * số duy nhất dùng để đối chiếu và hoàn tiền. Không đọc meta _woocs_order_rate vì WOOCS hay ghi sai tỷ giá vào đơn.
+ *
  * Khoá có thể đặt trong wp-config.php (nên dùng khi chạy thật để khoá không nằm trong DB/bản sao lưu):
  *   define( 'HTH_APPOTAPAY_PARTNER_CODE', '...' );
  *   define( 'HTH_APPOTAPAY_API_KEY', '...' );
@@ -21,6 +25,11 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	const META_DUPLICATE       = '_hth_appotapay_duplicate_txns';
 	const META_FINAL_REFS      = '_hth_appotapay_final_refs';
 	const META_CHECKED_AT      = '_hth_appotapay_checked_at';
+	/** Số VND gửi AppotaPay và tỷ giá dùng lúc bấm thanh toán (1 đơn vị tiền tệ của đơn = 1/rate VND). */
+	const META_VND             = '_hth_appotapay_vnd';
+	const META_RATE            = '_hth_appotapay_rate';
+	/** Sổ hoàn qua cổng: ['amount' => tổng đã hoàn theo tiền tệ đơn, 'vnd' => tổng VND đã hoàn], để hoàn nốt đúng phần còn lại và không vượt số đã thu. */
+	const META_REFUNDED        = '_hth_appotapay_refunded';
 
 	/** Số đơn tối đa mỗi lượt tra lại định kỳ, để không dồn lệnh gọi API. */
 	const RECONCILE_LIMIT = 10;
@@ -59,6 +68,13 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 		add_action( 'woocommerce_update_options_payment_gateways_' . $this->id, [ $this, 'process_admin_options' ] );
 		add_action( 'woocommerce_api_hth_appotapay_ipn', [ $this, 'handle_ipn' ] );
 		add_action( 'woocommerce_api_hth_appotapay_return', [ $this, 'handle_return' ] );
+
+		// Polylang (và Polylang for WooCommerce) dịch tiêu đề/mô tả cổng qua filter woocommerce_gateway_title/description;
+		// hai ô cho tiền tệ khác VND phải đăng ký thì mới có trong Chuỗi dịch.
+		if ( function_exists( 'pll_register_string' ) ) {
+			pll_register_string( 'AppotaPay: tiêu đề khi tiền tệ khác VND', (string) $this->get_option( 'title_foreign' ), 'HTH AppotaPay' );
+			pll_register_string( 'AppotaPay: mô tả khi tiền tệ khác VND', (string) $this->get_option( 'description_foreign' ), 'HTH AppotaPay', true );
+		}
 	}
 
 	public function init_form_fields() {
@@ -78,6 +94,18 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 				'title'   => 'Mô tả',
 				'type'    => 'textarea',
 				'default' => 'Thanh toán bằng thẻ ATM nội địa, Visa/Master/JCB, ví điện tử hoặc QR.',
+			],
+			'title_foreign'  => [
+				'title'       => 'Tiêu đề khi tiền tệ khác VND',
+				'type'        => 'text',
+				'default'     => 'Pay in VND',
+				'description' => 'Khách đang xem giá bằng USD, PHP… (qua plugin đổi tiền tệ WOOCS) sẽ thấy tiêu đề này; đơn được thu bằng VND theo tỷ giá trong WOOCS. Để trống thì ẩn cổng với tiền tệ khác VND.',
+			],
+			'description_foreign' => [
+				'title'       => 'Mô tả khi tiền tệ khác VND',
+				'type'        => 'textarea',
+				'default'     => 'You will be charged {vnd} by AppotaPay (≈ {total} at the store exchange rate). Your bank converts this amount to your currency.',
+				'description' => '{vnd} = số VND sẽ thu, {total} = tổng đơn theo tiền tệ khách đang xem.',
 			],
 			'sandbox'        => [
 				'title'       => 'Môi trường thử',
@@ -166,7 +194,11 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	}
 
 	public function is_available() {
-		if ( ! parent::is_available() || 'VND' !== get_woocommerce_currency() || ! $this->client()->is_configured() ) {
+		if ( ! parent::is_available() || ! $this->client()->is_configured() ) {
+			return false;
+		}
+		$currency = $this->context_currency();
+		if ( 'VND' !== $currency && ( '' === trim( (string) $this->get_option( 'title_foreign' ) ) || null === self::rate( $currency ) ) ) {
 			return false;
 		}
 		// Sandbox trên site thật: ai cũng trả được bằng thẻ test công khai. Chỉ để quản trị viên thử.
@@ -174,6 +206,86 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Tỷ giá quy về VND của một tiền tệ: 1 VND = rate đơn vị tiền tệ đó (đúng quy ước của WOOCS, tiền tệ gốc là VND).
+	 * Lấy từ bảng tiền tệ WOOCS, KHÔNG từ meta _woocs_order_rate của đơn (meta này sai ở hơn nửa số đơn thực tế).
+	 * Site không có WOOCS có thể cung cấp tỷ giá qua filter hth_appotapay_vnd_rate. Trả null khi không quy đổi được.
+	 */
+	public static function rate( string $currency ): ?float {
+		$rate = null;
+		if ( 'VND' === $currency ) {
+			$rate = 1.0;
+		} else {
+			global $WOOCS;
+			if ( is_object( $WOOCS ) && method_exists( $WOOCS, 'get_currencies' ) && 'VND' === (string) ( $WOOCS->default_currency ?? '' ) ) {
+				$r = (float) ( $WOOCS->get_currencies()[ $currency ]['rate'] ?? 0 );
+				$rate = $r > 0 ? $r : null;
+			}
+		}
+		$rate = apply_filters( 'hth_appotapay_vnd_rate', $rate, $currency );
+		return is_numeric( $rate ) && (float) $rate > 0 ? (float) $rate : null;
+	}
+
+	/** Số VND phải thu cho một tổng tiền theo tiền tệ đã cho: [vnd, rate], hoặc null nếu không quy đổi được. */
+	public static function to_vnd( float $total, string $currency ): ?array {
+		$rate = self::rate( $currency );
+		return null === $rate ? null : [ (int) round( $total / $rate ), $rate ];
+	}
+
+	/** Số VND đã gửi AppotaPay cho đơn; đơn tạo trước bản 0.3.0 (chỉ VND) không có meta thì lấy tổng đơn. */
+	private static function order_vnd( WC_Order $order ): int {
+		$vnd = (int) $order->get_meta( self::META_VND );
+		return $vnd > 0 ? $vnd : (int) round( (float) $order->get_total() );
+	}
+
+	/**
+	 * Tổng tiền và tiền tệ đang áp cho khách: đơn ở trang order-pay (khách trả lại đơn cũ) hoặc giỏ hàng ở checkout.
+	 * Trả null khi không ở hai chỗ đó (trang cài đặt, wp-admin...).
+	 *
+	 * @return array{0: float, 1: string, 2: string}|null [tổng, tiền tệ, tổng đã định dạng]
+	 */
+	private static function context_total(): ?array {
+		$order_id = function_exists( 'is_wc_endpoint_url' ) && is_wc_endpoint_url( 'order-pay' ) ? absint( get_query_var( 'order-pay' ) ) : 0;
+		$order    = $order_id ? wc_get_order( $order_id ) : null;
+		if ( $order ) {
+			return [ (float) $order->get_total(), $order->get_currency(), wp_strip_all_tags( $order->get_formatted_order_total() ) ];
+		}
+		if ( function_exists( 'WC' ) && WC()->cart ) {
+			// WooCommerce làm tròn tổng đơn theo số thập phân của cửa hàng khi tạo đơn (cửa hàng VND thường đặt 0,
+			// nên đơn USD 15,18 được lưu thành 15). Tính VND trên số sẽ lưu để số hiện ở checkout đúng bằng số sẽ thu.
+			$total = round( (float) WC()->cart->get_total( 'edit' ), wc_get_price_decimals() );
+			return [ $total, get_woocommerce_currency(), wp_strip_all_tags( WC()->cart->get_total() ) ];
+		}
+		return null;
+	}
+
+	private function context_currency(): string {
+		$ctx = self::context_total();
+		return $ctx ? $ctx[1] : get_woocommerce_currency();
+	}
+
+	public static function format_vnd( int $vnd ): string {
+		return number_format_i18n( $vnd ) . ' ₫';
+	}
+
+	/** Tiền tệ khác VND: tiêu đề/mô tả riêng, dịch qua Polylang rồi mới điền {vnd} {total}. */
+	public function get_title() {
+		if ( 'VND' === $this->context_currency() ) {
+			return parent::get_title();
+		}
+		return apply_filters( 'woocommerce_gateway_title', (string) $this->get_option( 'title_foreign' ), $this->id );
+	}
+
+	public function get_description() {
+		$ctx = self::context_total();
+		if ( ! $ctx || 'VND' === $ctx[1] ) {
+			return parent::get_description();
+		}
+		$text = (string) apply_filters( 'woocommerce_gateway_description', (string) $this->get_option( 'description_foreign' ), $this->id );
+		$conv = self::to_vnd( $ctx[0], $ctx[1] );
+		return strtr( $text, [ '{vnd}' => $conv ? self::format_vnd( $conv[0] ) : '', '{total}' => $ctx[2] ] );
 	}
 
 	private static function lang(): string {
@@ -245,8 +357,14 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	}
 
 	public function process_payment( $order_id ) {
-		$order  = wc_get_order( $order_id );
-		$amount = (int) round( (float) $order->get_total() );
+		$order    = wc_get_order( $order_id );
+		$currency = $order->get_currency();
+		$conv     = self::to_vnd( (float) $order->get_total(), $currency );
+		if ( null === $conv ) {
+			wc_add_notice( "AppotaPay không nhận thanh toán bằng $currency.", 'error' );
+			return [ 'result' => 'failure' ];
+		}
+		[ $amount, $rate ] = $conv;
 
 		if ( $amount < 1000 || $amount > 500000000 ) {
 			wc_add_notice( 'AppotaPay chỉ nhận đơn từ 1.000đ đến 500.000.000đ.', 'error' );
@@ -255,6 +373,9 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 
 		$ref = $this->new_ref( $order );
 		$order->update_meta_data( self::META_REFS, array_merge( array_filter( (array) $order->get_meta( self::META_REFS ) ), [ $ref ] ) );
+		// Số VND chốt ở lần bấm này; đối chiếu và hoàn tiền đều dùng số này, không tính lại từ tỷ giá sau.
+		$order->update_meta_data( self::META_VND, $amount );
+		$order->update_meta_data( self::META_RATE, $rate );
 		$order->save();
 
 		[ $code, $res ] = $this->client()->create_payment( [
@@ -286,7 +407,11 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			return [ 'result' => 'failure' ];
 		}
 
-		$order->add_order_note( sprintf( 'AppotaPay: tạo giao dịch %s (mã AppotaPay %s), chờ khách thanh toán.', $ref, $res['transaction']['transactionId'] ?? '?' ) );
+		$note = sprintf( 'AppotaPay: tạo giao dịch %s (mã AppotaPay %s), chờ khách thanh toán.', $ref, $res['transaction']['transactionId'] ?? '?' );
+		if ( 'VND' !== $currency ) {
+			$note .= sprintf( ' Thu %s cho đơn %s %s (tỷ giá WOOCS: 1 %s = %s ₫).', self::format_vnd( $amount ), wc_format_decimal( $order->get_total(), wc_get_price_decimals() ), $currency, $currency, number_format_i18n( 1 / $rate, 2 ) );
+		}
+		$order->add_order_note( $note );
 		return [ 'result' => 'success', 'redirect' => $url ];
 	}
 
@@ -312,7 +437,7 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			return 'pending';
 		}
 
-		$expected = (int) round( (float) $order->get_total() );
+		$expected = self::order_vnd( $order );
 		$paid     = (int) ( $t['orderAmount'] ?? -1 );
 		$txn      = (string) ( $t['transactionId'] ?? '' );
 
@@ -333,7 +458,8 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 			$order = wc_get_order( $order->get_id() );
 			if ( ! $order->is_paid() ) {
 				$order->payment_complete( $txn );
-				$order->add_order_note( sprintf( 'AppotaPay: thanh toán thành công %s đ qua %s %s (mã %s).', number_format_i18n( $paid ), $t['paymentMethod'] ?? '', $t['bankCode'] ?? '', $txn ) );
+				$foreign = 'VND' !== $order->get_currency() ? sprintf( ' cho đơn %s %s', wc_format_decimal( $order->get_total(), wc_get_price_decimals() ), $order->get_currency() ) : '';
+				$order->add_order_note( sprintf( 'AppotaPay: thanh toán thành công %s đ%s qua %s %s (mã %s).', number_format_i18n( $paid ), $foreign, $t['paymentMethod'] ?? '', $t['bankCode'] ?? '', $txn ) );
 			} elseif ( $order->get_transaction_id() !== $txn && ! in_array( $txn, (array) $order->get_meta( self::META_DUPLICATE ), true ) ) {
 				// Khách mở hai tab và trả cả hai lần: không được nuốt im lần trả thứ hai.
 				$order->update_meta_data( self::META_DUPLICATE, array_merge( array_filter( (array) $order->get_meta( self::META_DUPLICATE ) ), [ $txn ] ) );
@@ -473,13 +599,24 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 	public function process_refund( $order_id, $amount = null, $reason = '' ) {
 		$order = wc_get_order( $order_id );
 		$txn   = $order ? $order->get_transaction_id() : '';
-		$value = (int) round( (float) $amount );
-
 		if ( ! $txn ) {
 			return new WP_Error( 'appotapay_refund', 'Đơn chưa có mã giao dịch AppotaPay.' );
 		}
+
+		// $amount tính theo tiền tệ của đơn; AppotaPay hoàn bằng VND theo đúng tỷ giá đã thu.
+		// Hoàn nốt phần còn lại của đơn thì hoàn đúng phần VND còn lại, khỏi lệch vì làm tròn; hoàn một phần thì không được vượt phần còn lại.
+		// Dùng sổ riêng của plugin thay vì get_total_refunded() của WooCommerce, vì số đó có cache và đã gồm cả lần hoàn đang xử lý.
+		$vnd_paid    = self::order_vnd( $order );
+		$rate        = (float) $order->get_meta( self::META_RATE ) ?: 1.0;
+		$ledger      = (array) $order->get_meta( self::META_REFUNDED );
+		$done_amount = (float) ( $ledger['amount'] ?? 0 );
+		$done_vnd    = (int) ( $ledger['vnd'] ?? 0 );
+		$vnd_left    = max( 0, $vnd_paid - $done_vnd );
+		$whole       = (float) $amount >= (float) $order->get_total() - $done_amount - 0.005;
+		$value       = $whole ? $vnd_left : min( (int) round( (float) $amount / $rate ), $vnd_left );
+
 		if ( $value < 1000 ) {
-			return new WP_Error( 'appotapay_refund', 'AppotaPay chỉ hoàn từ 1.000đ trở lên.' );
+			return new WP_Error( 'appotapay_refund', 0 === $vnd_left ? 'Đã hoàn hết số VND AppotaPay thu của đơn này.' : 'AppotaPay chỉ hoàn từ 1.000đ trở lên.' );
 		}
 
 		// Lần hoàn trước bị mất kết nối: tra lệnh cũ trước, không gửi lệnh mới mù quáng (dễ hoàn hai lần).
@@ -527,7 +664,10 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 		if ( 200 !== $code || ! in_array( $status, [ 'pending', 'processing', 'success' ], true ) ) {
 			return new WP_Error( 'appotapay_refund', 'AppotaPay từ chối hoàn tiền: ' . ( $res['message'] ?? "HTTP $code" ) );
 		}
-		$order->add_order_note( sprintf( 'AppotaPay: yêu cầu hoàn %s đ, trạng thái %s (mã hoàn %s, mã đối tác %s).', number_format_i18n( $value ), $status, $res['refundId'] ?? '?', $ref ) );
+		$order->update_meta_data( self::META_REFUNDED, [ 'amount' => $done_amount + (float) $amount, 'vnd' => $done_vnd + $value ] );
+		$order->save();
+		$foreign = 'VND' !== $order->get_currency() ? sprintf( ' (%s %s của đơn)', wc_format_decimal( $amount, wc_get_price_decimals() ), $order->get_currency() ) : '';
+		$order->add_order_note( sprintf( 'AppotaPay: yêu cầu hoàn %s đ%s, trạng thái %s (mã hoàn %s, mã đối tác %s).', number_format_i18n( $value ), $foreign, $status, $res['refundId'] ?? '?', $ref ) );
 		return true;
 	}
 }

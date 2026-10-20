@@ -3,7 +3,7 @@
  * Plugin Name: HTH AppotaPay
  * Plugin URI: https://github.com/hanthienhai/hth-appotapay
  * Description: Cổng thanh toán AppotaPay (hosted checkout v2) cho WooCommerce.
- * Version: 0.2.1
+ * Version: 0.3.0
  * Author: hanthienhai
  * Author URI: https://github.com/hanthienhai
  * License: GPL-2.0-or-later
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'HTH_APPOTAPAY_VERSION', '0.2.1' );
+define( 'HTH_APPOTAPAY_VERSION', '0.3.0' );
 define( 'HTH_APPOTAPAY_DIR', __DIR__ );
 define( 'HTH_APPOTAPAY_RECONCILE_HOOK', 'hth_appotapay_reconcile' );
 
