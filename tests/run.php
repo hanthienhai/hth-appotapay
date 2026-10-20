@@ -521,6 +521,17 @@ $check( 'API báo 144 (số USD) thay vì số VND: không xác nhận, tạm gi
 $mock = fn() => $txn_ok( $ref, $vnd, 'TXU1' );
 $check( 'API báo đúng số VND đã lưu: xác nhận đơn USD', 'success' === $call( 'reconcile', wc_get_order( $o->get_id() ), $ref ) && wc_get_order( $o->get_id() )->is_paid() );
 
+// WOOCS báo 0 thập phân cho VND, nên đơn USD 15,18 nạp trong ngữ cảnh VND (trang tiếng Việt, wp-admin, WP-CLI) hiện 15 dù kho giữ 15,18.
+$WOOCS->set_currency( 'USD' );
+$o = $new_foreign( 'USD', 15.18 );
+$WOOCS->set_currency( 'VND' );
+wp_cache_flush();
+$o = wc_get_order( $o->get_id() );
+$check( 'Đơn USD 15,18 nạp trong ngữ cảnh VND: WooCommerce hiện 15 (hành vi WOOCS)', 15.0 === (float) $o->get_total() );
+$mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APU0' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
+$g->process_payment( $o->get_id() );
+$check( 'Plugin đọc tổng thô 15,18: thu đúng số VND của 15,18 chứ không phải của 15', HTH_AppotaPay_Gateway::to_vnd( 15.18, 'USD' )[0] === (int) wc_get_order( $o->get_id() )->get_meta( '_hth_appotapay_vnd' ) );
+
 $o = $new_foreign( 'PHP', 7616 );
 $mock = fn() => [ 200, [ 'transaction' => [ 'transactionId' => 'APP1' ], 'payment' => [ 'url' => 'https://payment.dev.appotapay.com/x' ] ] ];
 $g->process_payment( $o->get_id() );
