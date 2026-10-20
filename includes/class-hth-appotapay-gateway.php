@@ -8,7 +8,7 @@
  *
  * AppotaPay chỉ thu VND. Đơn bằng tiền tệ khác (khách đổi tiền qua WOOCS) được quy về VND theo tỷ giá
  * trong bảng tiền tệ của WOOCS: vnd = tổng đơn / rate. Số VND này ghi vào đơn lúc bấm thanh toán và là
- * số duy nhất dùng để đối chiếu và hoàn tiền. Không đọc meta _woocs_order_rate vì WOOCS hay ghi sai tỷ giá vào đơn.
+ * số duy nhất dùng để đối chiếu và hoàn tiền. Không đọc meta _woocs_order_rate vì WOOCS ghi đè nó mỗi lần trang "Cảm ơn" của đơn được mở, theo tiền tệ của người mở.
  *
  * Khoá có thể đặt trong wp-config.php (nên dùng khi chạy thật để khoá không nằm trong DB/bản sao lưu):
  *   define( 'HTH_APPOTAPAY_PARTNER_CODE', '...' );
@@ -210,7 +210,7 @@ class HTH_AppotaPay_Gateway extends WC_Payment_Gateway {
 
 	/**
 	 * Tỷ giá quy về VND của một tiền tệ: 1 VND = rate đơn vị tiền tệ đó (đúng quy ước của WOOCS, tiền tệ gốc là VND).
-	 * Lấy từ bảng tiền tệ WOOCS, KHÔNG từ meta _woocs_order_rate của đơn (meta này sai ở hơn nửa số đơn thực tế).
+	 * Lấy từ bảng tiền tệ WOOCS, KHÔNG từ meta _woocs_order_rate của đơn (WOOCS ghi đè meta này ở mọi lượt mở trang "Cảm ơn", kể cả sai khoá đơn; thực tế sai ở khoảng 1/3 đơn).
 	 * Site không có WOOCS có thể cung cấp tỷ giá qua filter hth_appotapay_vnd_rate. Trả null khi không quy đổi được.
 	 */
 	public static function rate( string $currency ): ?float {
